@@ -5,12 +5,15 @@
 #include "esphomelib/web_server.h"
 #include "esphomelib/log.h"
 #include "esphomelib/application.h"
+#include "StreamString.h"
 
 #ifdef ARDUINO_ARCH_ESP32
   #include <ESPmDNS.h>
+#include <Update.h>
 #endif
 #ifdef ARDUINO_ARCH_ESP8266
   #include <ESP8266mDNS.h>
+  #include <Updater.h>
 #endif
 
 #include <cstdlib>
@@ -76,7 +79,7 @@ void WebServer::set_port(uint16_t port) {
 }
 
 void WebServer::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up web server on port %u...", this->port_);
+  ESP_LOGCONFIG(TAG, "Setting up web server...");
   this->server_ = new AsyncWebServer(this->port_);
   MDNS.addService("http", "tcp", this->port_);
 
@@ -124,12 +127,94 @@ void WebServer::setup() {
 
   this->server_->begin();
 
-  this->set_interval(10000, [this](){
+  this->set_interval(10000, [this]() {
     this->events_.send("", "ping", millis(), 30000);
   });
 }
+void WebServer::dump_config() {
+  ESP_LOGCONFIG(TAG, "Web Server:");
+  ESP_LOGCONFIG(TAG, "  Address: %s:%u", WiFi.localIP().toString().c_str(), this->port_);
+}
 float WebServer::get_setup_priority() const {
-  return setup_priority::MQTT_CLIENT;
+  return setup_priority::WIFI - 1.0f;
+}
+
+void WebServer::handle_update_request(AsyncWebServerRequest *request) {
+  AsyncWebServerResponse *response;
+  if (!Update.hasError()) {
+    response = request->beginResponse(200, "text/plain", "Update Successful!");
+  } else {
+    StreamString ss;
+    ss.print("Update Failed: ");
+    Update.printError(ss);
+    response = request->beginResponse(200, "text/plain", ss);
+  }
+  response->addHeader("Connection", "close");
+  request->send(response);
+}
+
+void report_ota_error() {
+  StreamString ss;
+  Update.printError(ss);
+  ESP_LOGW(TAG, "OTA Update failed! Error: %s", ss.c_str());
+}
+
+void WebServer::handleUpload(AsyncWebServerRequest *request,
+                             const String &filename,
+                             size_t index,
+                             uint8_t *data,
+                             size_t len,
+                             bool final) {
+  bool success;
+  if (index == 0) {
+    ESP_LOGI(TAG, "OTA Update Start: %s", filename.c_str());
+    this->ota_read_length_ = 0;
+#ifdef ARDUINO_ARCH_ESP8266
+    Update.runAsync(true);
+    success = Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000);
+#endif
+#ifdef ARDUINO_ARCH_ESP32
+    if (Update.isRunning())
+      Update.abort();
+    success = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+#endif
+    if (!success) {
+      report_ota_error();
+      return;
+    }
+  } else if (Update.hasError()) {
+    // don't spam logs with errors if something failed at start
+    return;
+  }
+
+  success = Update.write(data, len) == len;
+  if (!success) {
+    report_ota_error();
+    return;
+  }
+  this->ota_read_length_ += len;
+
+  const uint32_t now = millis();
+  if (now - this->last_ota_progress_ > 1000) {
+    if (request->contentLength() != 0) {
+      float percentage = (this->ota_read_length_ * 100.0f) / request->contentLength();
+      ESP_LOGD(TAG, "OTA in progress: %0.1f%%", percentage);
+    } else {
+      ESP_LOGD(TAG, "OTA in progress: %u bytes read", this->ota_read_length_);
+    }
+    this->last_ota_progress_ = now;
+  }
+
+  if (final) {
+    if (Update.end(true)) {
+      ESP_LOGI(TAG, "OTA update successful!");
+      this->set_timeout(100, []() {
+        safe_reboot("ota");
+      });
+    } else {
+      report_ota_error();
+    }
+  }
 }
 
 void WebServer::handle_index_request(AsyncWebServerRequest *request) {
@@ -179,6 +264,7 @@ void WebServer::handle_index_request(AsyncWebServerRequest *request) {
 
   stream->print(
       F("</tbody></table><p>See <a href=\"https://esphomelib.com/web-api/index.html\">esphomelib Web API</a> for REST API documentation.</p>"
+        "<h2>OTA Update</h2><form method='POST' action=\"/update\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"update\"><input type=\"submit\" value=\"Update\"></form>"
         "<h2>Debug Log</h2><pre id=\"log\"></pre>"
         "<script src=\"")
   );
@@ -196,6 +282,9 @@ void WebServer::handle_index_request(AsyncWebServerRequest *request) {
 void WebServer::register_sensor(sensor::Sensor *obj) {
   StoringController::register_sensor(obj);
   obj->add_on_state_callback([this, obj](float value) {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj, value] {
       this->events_.send(this->sensor_json(obj, value).c_str(), "state");
     });
@@ -227,6 +316,9 @@ std::string WebServer::sensor_json(sensor::Sensor *obj, float value) {
 void WebServer::register_text_sensor(text_sensor::TextSensor *obj) {
   StoringController::register_text_sensor(obj);
   obj->add_on_state_callback([this, obj](std::string value) {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj, value] {
       this->events_.send(this->text_sensor_json(obj, value).c_str(), "state");
     });
@@ -254,6 +346,9 @@ std::string WebServer::text_sensor_json(text_sensor::TextSensor *obj, const std:
 void WebServer::register_switch(switch_::Switch *obj) {
   StoringController::register_switch(obj);
   obj->add_on_state_callback([this, obj](bool value) {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj, value] {
       this->events_.send(this->switch_json(obj, value).c_str(), "state");
     });
@@ -275,13 +370,19 @@ void WebServer::handle_switch_request(AsyncWebServerRequest *request, UrlMatch m
       std::string data = this->switch_json(obj, obj->state);
       request->send(200, "text/json", data.c_str());
     } else if (match.method == "toggle") {
-      obj->toggle();
+      this->defer([obj] () {
+        obj->toggle();
+      });
       request->send(200);
     } else if (match.method == "turn_on") {
-      obj->turn_on();
+      this->defer([obj] () {
+        obj->turn_on();
+      });
       request->send(200);
     } else if (match.method == "turn_off") {
-      obj->turn_off();
+      this->defer([obj] () {
+        obj->turn_off();
+      });
       request->send(200);
     } else {
       request->send(404);
@@ -296,6 +397,9 @@ void WebServer::handle_switch_request(AsyncWebServerRequest *request, UrlMatch m
 void WebServer::register_binary_sensor(binary_sensor::BinarySensor *obj) {
   StoringController::register_binary_sensor(obj);
   obj->add_on_state_callback([this, obj](bool value) {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj, value] {
       this->events_.send(this->binary_sensor_json(obj, value).c_str(), "state");
     });
@@ -324,6 +428,9 @@ void WebServer::handle_binary_sensor_request(AsyncWebServerRequest *request, Url
 void WebServer::register_fan(fan::FanState *obj) {
   StoringController::register_fan(obj);
   obj->add_on_state_callback([this, obj]() {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj] {
       this->events_.send(this->fan_json(obj).c_str(), "state");
     });
@@ -357,7 +464,9 @@ void WebServer::handle_fan_request(AsyncWebServerRequest *request, UrlMatch matc
       std::string data = this->fan_json(obj);
       request->send(200, "text/json", data.c_str());
     } else if (match.method == "toggle") {
-      obj->toggle().perform();
+      this->defer([obj] () {
+        obj->toggle().perform();
+      });
       request->send(200);
     } else if (match.method == "turn_on") {
       auto call = obj->turn_on();
@@ -383,9 +492,14 @@ void WebServer::handle_fan_request(AsyncWebServerRequest *request, UrlMatch matc
             return;
         }
       }
+      this->defer([call] () {
+        call.perform();
+      });
       request->send(200);
     } else if (match.method == "turn_off") {
-      obj->turn_off().perform();
+      this->defer([obj] () {
+        obj->turn_off().perform();
+      });
       request->send(200);
     } else {
       request->send(404);
@@ -400,6 +514,9 @@ void WebServer::handle_fan_request(AsyncWebServerRequest *request, UrlMatch matc
 void WebServer::register_light(light::LightState *obj) {
   StoringController::register_light(obj);
   obj->add_new_remote_values_callback([this, obj]() {
+    if (this->events_.count() == 0)
+      return;
+
     this->defer([this, obj] {
       this->events_.send(this->light_json(obj).c_str(), "state");
     });
@@ -414,7 +531,9 @@ void WebServer::handle_light_request(AsyncWebServerRequest *request, UrlMatch ma
       std::string data = this->light_json(obj);
       request->send(200, "text/json", data.c_str());
     } else if (match.method == "toggle") {
-      obj->toggle().perform();
+      this->defer([obj] () {
+        obj->toggle().perform();
+      });
       request->send(200);
     } else if (match.method == "turn_on") {
       auto call = obj->turn_on();
@@ -433,20 +552,20 @@ void WebServer::handle_light_request(AsyncWebServerRequest *request, UrlMatch ma
       if (obj->get_traits().has_color_temperature() && request->hasParam("color_temp"))
         call.set_color_temperature(request->getParam("color_temp")->value().toFloat());
 
-
       if (request->hasParam("flash"))
         call.set_flash_length(request->getParam("flash")->value().toFloat() * 1000);
 
       if (request->hasParam("transition"))
         call.set_transition_length(request->getParam("transition")->value().toFloat() * 1000);
 
-
       if (request->hasParam("effect")) {
         const char *effect = request->getParam("effect")->value().c_str();
         call.set_effect(effect);
       }
 
-      call.perform();
+      this->defer([call] () {
+        call.perform();
+      });
       request->send(200);
     } else if (match.method == "turn_off") {
       auto call = obj->turn_off();
@@ -454,7 +573,9 @@ void WebServer::handle_light_request(AsyncWebServerRequest *request, UrlMatch ma
         uint32_t length = request->getParam("transition")->value().toFloat() * 1000;
         call.set_transition_length(length);
       }
-      call.perform();
+      this->defer([call] () {
+        call.perform();
+      });
       request->send(200);
     } else {
       request->send(404);
@@ -474,6 +595,9 @@ std::string WebServer::light_json(light::LightState *obj) {
 
 bool WebServer::canHandle(AsyncWebServerRequest *request) {
   if (request->url() == "/")
+    return true;
+
+  if (request->url() == "/update" && request->method() == HTTP_POST)
     return true;
 
   UrlMatch match = match_url(request->url().c_str(), true);
@@ -517,6 +641,11 @@ bool WebServer::canHandle(AsyncWebServerRequest *request) {
 void WebServer::handleRequest(AsyncWebServerRequest *request) {
   if (request->url() == "/") {
     this->handle_index_request(request);
+    return;
+  }
+
+  if (request->url() == "/update") {
+    this->handle_update_request(request);
     return;
   }
 

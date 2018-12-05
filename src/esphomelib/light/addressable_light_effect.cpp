@@ -12,10 +12,12 @@ void AddressableLightEffect::start_() {
   this->get_addressable_()->set_effect_active(true);
   this->get_addressable_()->clear_effect_data();
   this->start();
+  is->high_freq_.start();
 }
 
 void AddressableLightEffect::stop() {
   this->get_addressable_()->set_effect_active(false);
+  is->high_freq_.stop();
 }
 
 AddressableLight *AddressableLightEffect::get_addressable_() const {

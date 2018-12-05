@@ -5,6 +5,7 @@
 #include "esphomelib/component.h"
 #include "esphomelib/helpers.h"
 #include "esphomelib/defines.h"
+#include "esphomelib/esppreferences.h"
 
 ESPHOMELIB_NAMESPACE_BEGIN
 
@@ -59,21 +60,24 @@ class RangeCondition : public Condition<float> {
 };
 
 template<typename T>
+class Automation;
+
+template<typename T>
 class Trigger {
  public:
-  void add_on_trigger_callback(std::function<void(T)> &&f);
   void trigger(T x);
+  void set_parent(Automation<T> *parent);
  protected:
-  CallbackManager<void(T)> on_trigger_;
+  Automation<T> *parent_;
 };
 
 template<>
 class Trigger<NoArg> {
  public:
-  void add_on_trigger_callback(std::function<void(NoArg)> &&f);
   void trigger();
+  void set_parent(Automation<NoArg> *parent);
  protected:
-  CallbackManager<void(NoArg)> on_trigger_;
+  Automation<NoArg> *parent_;
 };
 
 class StartupTrigger : public Trigger<NoArg>, public Component {
@@ -94,17 +98,28 @@ class ShutdownTrigger : public Trigger<const char *> {
 class LoopTrigger : public Trigger<NoArg>, public Component {
  public:
   void loop() override;
+  float get_setup_priority() const override;
 };
 
 template<typename T>
 class ScriptExecuteAction;
+template<typename T>
+class ScriptStopAction;
+
+template<typename T>
+class ScriptStopAction;
 
 class Script : public Trigger<NoArg> {
  public:
   void execute();
 
+  void stop();
+
   template<typename T>
   ScriptExecuteAction<T> *make_execute_action();
+
+  template<typename T>
+  ScriptStopAction<T> *make_stop_action();
 };
 
 template<typename T>
@@ -115,6 +130,8 @@ class Action {
  public:
   virtual void play(T x) = 0;
   void play_next(T x);
+  virtual void stop();
+  void stop_next();
  protected:
   friend ActionList<T>;
 
@@ -128,8 +145,10 @@ class DelayAction : public Action<T>, public Component {
 
   void set_delay(std::function<uint32_t(T)> &&delay);
   void set_delay(uint32_t delay);
+  void stop() override;
 
   void play(T x) override;
+  float get_setup_priority() const override;
  protected:
   TemplatableValue<uint32_t, T> delay_{0};
 };
@@ -154,10 +173,29 @@ class IfAction : public Action<T> {
 
   void play(T x) override;
 
+  void stop() override;
+
  protected:
   std::vector<Condition<T> *> conditions_;
   ActionList<T> then_;
   ActionList<T> else_;
+};
+
+template<typename T>
+class WhileAction : public Action<T> {
+ public:
+  WhileAction(const std::vector<Condition<T> *> &conditions);
+
+  void add_then(const std::vector<Action<T> *> &actions);
+
+  void play(T x) override;
+
+  void stop() override;
+
+ protected:
+  std::vector<Condition<T> *> conditions_;
+  ActionList<T> then_;
+  bool is_running_{false};
 };
 
 template<typename T>
@@ -180,11 +218,22 @@ class ScriptExecuteAction : public Action<T> {
 };
 
 template<typename T>
+class ScriptStopAction : public Action<T> {
+ public:
+  ScriptStopAction(Script *script);
+
+  void play(T x) override;
+ protected:
+  Script *script_;
+};
+
+template<typename T>
 class ActionList {
  public:
   Action<T> *add_action(Action<T> *action);
   void add_actions(const std::vector<Action<T> *> &actions);
   void play(T x);
+  void stop();
   bool empty() const;
 
  protected:
@@ -203,12 +252,38 @@ class Automation {
   Action<T> *add_action(Action<T> *action);
   void add_actions(const std::vector<Action<T> *> &actions);
 
- protected:
   void process_trigger_(T x);
 
+  void stop();
+
+ protected:
   Trigger<T> *trigger_;
   std::vector<Condition<T> *> conditions_;
   ActionList<T> actions_;
+};
+
+template<typename T>
+class GlobalVariableComponent : public Component {
+ public:
+  explicit GlobalVariableComponent();
+  explicit GlobalVariableComponent(T initial_value);
+
+  T &value();
+
+  void setup() override;
+
+  float get_setup_priority() const override;
+
+  void loop() override;
+
+  void set_restore_value(uint32_t name_hash);
+
+ protected:
+  T value_{};
+  T prev_value_{};
+  bool restore_value_{false};
+  uint32_t name_hash_{};
+  ESPPreferenceObject rtc_;
 };
 
 ESPHOMELIB_NAMESPACE_END

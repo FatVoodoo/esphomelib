@@ -36,6 +36,8 @@ std::string get_mac_address();
 
 void tick_status_led();
 
+void feed_wdt();
+
 /// Constructs a hostname by concatenating base, a hyphen, and the MAC address.
 std::string generate_hostname(const std::string &base);
 
@@ -70,10 +72,22 @@ void run_safe_shutdown_hooks(const char *cause);
 std::string to_lowercase_underscore(std::string s);
 
 /// Build a JSON string with the provided json build function.
+const char *build_json(const json_build_t &f, size_t *length);
+
 std::string build_json(const json_build_t &f);
 
 /// Parse a JSON string and run the provided json parse function if it's valid.
 void parse_json(const std::string &data, const json_parse_t &f);
+
+class HighFrequencyLoopRequester {
+ public:
+  void start();
+  void stop();
+
+  static bool is_high_frequency();
+ protected:
+  bool started_{false};
+};
 
 /** Clamp the value between min and max.
  *
@@ -292,6 +306,8 @@ class VectorJsonBuffer : public ArduinoJson::Internals::JsonBufferBase<VectorJso
   };
 
   void* alloc(size_t bytes) override;
+
+  size_t size() const;
 
   void clear();
 

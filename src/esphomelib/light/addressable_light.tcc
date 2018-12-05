@@ -1,3 +1,6 @@
+#ifndef ESPHOMELIB_LIGHT_ADDRESSABLE_LIGHT_TCC
+#define ESPHOMELIB_LIGHT_ADDRESSABLE_LIGHT_TCC
+
 #include "esphomelib/defines.h"
 
 #ifdef USE_LIGHT
@@ -303,3 +306,5 @@ ESPHSVColor::ESPHSVColor(uint8_t hue, uint8_t saturation, uint8_t value)
 ESPHOMELIB_NAMESPACE_END
 
 #endif //USE_LIGHT
+
+#endif //ESPHOMELIB_LIGHT_ADDRESSABLE_LIGHT_TCC

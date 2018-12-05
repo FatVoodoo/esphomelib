@@ -43,6 +43,9 @@ using namespace esphomelib::time;
 #ifdef USE_TEXT_SENSOR
 using namespace esphomelib::text_sensor;
 #endif
+#ifdef USE_STEPPER
+using namespace esphomelib::stepper;
+#endif
 
 static const char *TAG = "application";
 
@@ -51,7 +54,7 @@ void Application::setup() {
   assert(this->application_state_ == COMPONENT_STATE_CONSTRUCTION && "setup() called twice.");
   ESP_LOGV(TAG, "Sorting components by setup priority...");
   std::stable_sort(this->components_.begin(), this->components_.end(), [](const Component *a, const Component *b) {
-    return a->get_setup_priority() > b->get_setup_priority();
+    return a->get_actual_setup_priority() > b->get_actual_setup_priority();
   });
 
   for (uint32_t i = 0; i < this->components_.size(); i++) {
@@ -83,10 +86,17 @@ void Application::setup() {
 
   this->application_state_ = COMPONENT_STATE_SETUP;
 
+  ESP_LOGI(TAG, "setup() finished successfully!");
+
   if (this->compilation_time_.empty()) {
     ESP_LOGI(TAG, "You're running esphomelib v" ESPHOMELIB_VERSION);
   } else {
     ESP_LOGI(TAG, "You're running esphomelib v" ESPHOMELIB_VERSION " compiled on %s", this->compilation_time_.c_str());
+  }
+
+  for (uint32_t i = 0; i < this->components_.size(); i++) {
+    Component *component = this->components_[i];
+    component->dump_config();
   }
 }
 
@@ -106,12 +116,24 @@ void HOT Application::loop() {
     }
     new_global_state |= component->get_component_state();
     global_state |= new_global_state;
+    feed_wdt();
   }
   global_state = new_global_state;
-  yield();
 
-  if (first_loop)
+  const uint32_t now = millis();
+  if (HighFrequencyLoopRequester::is_high_frequency()) {
+    yield();
+  } else {
+    uint32_t delay_time = this->loop_interval_;
+    if (now - this->last_loop_ < this->loop_interval_)
+      delay_time = this->loop_interval_ - (now - this->last_loop_);
+    delay(delay_time);
+  }
+  this->last_loop_  = now;
+
+  if (first_loop) {
     ESP_LOGI(TAG, "First loop finished successfully!");
+  }
 }
 
 WiFiComponent *Application::init_wifi(const std::string &ssid, const std::string &password) {
@@ -233,6 +255,14 @@ LEDCOutputComponent *Application::make_ledc_output(uint8_t pin, float frequency,
 PCA9685OutputComponent *Application::make_pca9685_component(float frequency) {
   auto *pca9685 = new PCA9685OutputComponent(this->i2c_, frequency);
   return this->register_component(pca9685);
+}
+#endif
+
+#ifdef USE_MY9231_OUTPUT
+MY9231OutputComponent *Application::make_my9231_component(const GPIOOutputPin &pin_di,
+                                                          const GPIOOutputPin &pin_dcki) {
+  auto *my9231 = new MY9231OutputComponent(pin_di.copy(), pin_dcki.copy());
+  return this->register_component(my9231);
 }
 #endif
 
@@ -380,7 +410,7 @@ const std::string &Application::get_name() const {
 #ifdef USE_FAN
 Application::MakeFan Application::make_fan(const std::string &friendly_name) {
   MakeFan s{};
-  s.state = new FanState(friendly_name);
+  s.state = this->register_component(new FanState(friendly_name));
   s.mqtt = this->register_fan(s.state);
   s.output = this->register_component(new BasicFanComponent());
   s.output->set_state(s.state);
@@ -500,13 +530,11 @@ I2CComponent *Application::init_i2c(uint8_t sda_pin, uint8_t scl_pin, bool scan)
 
 #ifdef USE_STATUS_BINARY_SENSOR
 Application::MakeStatusBinarySensor Application::make_status_binary_sensor(const std::string &friendly_name) {
-  assert(this->mqtt_client_ != nullptr);
-  auto *binary_sensor = new StatusBinarySensor(friendly_name); // not a component
+  auto *binary_sensor = this->register_component(new StatusBinarySensor(friendly_name));
   auto *mqtt = this->register_binary_sensor(binary_sensor);
   mqtt->set_custom_state_topic(this->mqtt_client_->get_availability().topic);
-  mqtt->set_payload_on(this->mqtt_client_->get_availability().payload_available);
-  mqtt->set_payload_off(this->mqtt_client_->get_availability().payload_not_available);
   mqtt->disable_availability();
+  mqtt->set_is_status(true);
   return MakeStatusBinarySensor{
       .status = binary_sensor,
       .mqtt = mqtt,
@@ -516,7 +544,7 @@ Application::MakeStatusBinarySensor Application::make_status_binary_sensor(const
 
 #ifdef USE_RESTART_SWITCH
 Application::MakeRestartSwitch Application::make_restart_switch(const std::string &friendly_name) {
-  auto *switch_ = this->register_component(new RestartSwitch(friendly_name)); // not a component
+  auto *switch_ = new RestartSwitch(friendly_name); // not a component
   return MakeRestartSwitch{
       .restart = switch_,
       .mqtt = this->register_switch(switch_),
@@ -526,7 +554,7 @@ Application::MakeRestartSwitch Application::make_restart_switch(const std::strin
 
 #ifdef USE_SHUTDOWN_SWITCH
 Application::MakeShutdownSwitch Application::make_shutdown_switch(const std::string &friendly_name) {
-  auto *switch_ = this->register_component(new ShutdownSwitch(friendly_name));
+  auto *switch_ = new ShutdownSwitch(friendly_name);
   return MakeShutdownSwitch{
       .shutdown = switch_,
       .mqtt = this->register_switch(switch_),
@@ -779,10 +807,6 @@ Application::MakeRotaryEncoderSensor Application::make_rotary_encoder_sensor(con
 }
 #endif
 
-mqtt::MQTTMessageTrigger *Application::make_mqtt_message_trigger(const std::string &topic, uint8_t qos) {
-  return global_mqtt_client->make_message_trigger(topic, qos);
-}
-
 StartupTrigger *Application::make_startup_trigger() {
   return this->register_component(new StartupTrigger());
 }
@@ -952,7 +976,7 @@ PN532Component *Application::make_pn532_component(SPIComponent *parent,
 Application::MakeUARTSwitch Application::make_uart_switch(UARTComponent *parent,
                                                           const std::string &name,
                                                           const std::vector<uint8_t> &data) {
-  auto *uart = this->register_component(new UARTSwitch(parent, name, data));
+  auto *uart = new UARTSwitch(parent, name, data);
 
   return MakeUARTSwitch{
       .uart = uart,
@@ -1125,18 +1149,9 @@ display::GPIOLCDDisplay *Application::make_gpio_lcd_display(uint8_t columns, uin
 }
 #endif
 
-#ifdef USE_TIME
-RTCComponent *Application::make_rtc_component(const std::string &tz) {
-  return this->register_component(new RTCComponent(tz));
-}
-#endif
-
 #ifdef USE_SNTP_COMPONENT
-SNTPComponent *Application::make_sntp_component(const std::string &server_1,
-                                                const std::string &server_2,
-                                                const std::string &server_3,
-                                                const std::string &tz) {
-  return this->register_component(new SNTPComponent(server_1, server_2, server_3, tz));
+SNTPComponent *Application::make_sntp_component() {
+  return this->register_component(new SNTPComponent());
 }
 #endif
 
@@ -1211,8 +1226,8 @@ Application::MakeTemplateTextSensor Application::make_template_text_sensor(const
 #endif
 
 #ifdef USE_CSE7766
-sensor::CSE7766Component *Application::make_cse7766(UARTComponent *parent) {
-  return this->register_component(new sensor::CSE7766Component(parent));
+sensor::CSE7766Component *Application::make_cse7766(UARTComponent *parent, uint32_t update_interval) {
+  return this->register_component(new sensor::CSE7766Component(parent, update_interval));
 }
 #endif
 
@@ -1221,6 +1236,44 @@ sensor::PMSX003Component *Application::make_pmsx003(UARTComponent *parent, senso
   return this->register_component(new PMSX003Component(parent, type));
 }
 #endif
+
+#ifdef USE_A4988
+stepper::A4988 *Application::make_a4988(const GPIOOutputPin &step_pin, const GPIOOutputPin &dir_pin) {
+  return this->register_component(new A4988(step_pin.copy(), dir_pin.copy()));
+}
+#endif
+
+#ifdef USE_TOTAL_DAILY_ENERGY_SENSOR
+Application::MakeTotalDailyEnergySensor Application::make_total_daily_energy_sensor(const std::string &name,
+                                                                                    time::RealTimeClockComponent *time,
+                                                                                    sensor::Sensor *parent) {
+  auto total = this->register_component(new TotalDailyEnergy(name, time, parent));
+  return {
+      .total_energy = total,
+      .mqtt = this->register_sensor(total)
+  };
+}
+#endif
+
+void Application::set_loop_interval(uint32_t loop_interval) {
+  this->loop_interval_ = loop_interval;
+}
+
+void Application::register_component_(Component *comp) {
+  if (comp == nullptr) {
+    ESP_LOGW(TAG, "Tried to register null component!");
+    return;
+  }
+
+  for (auto *c : this->components_) {
+    if (comp == c) {
+      ESP_LOGW(TAG, "Component already registered! (%p)", c);
+      return;
+    }
+  }
+  this->components_.push_back(comp);
+}
+
 
 Application App; // NOLINT
 

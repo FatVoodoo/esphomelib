@@ -1,3 +1,6 @@
+#ifndef ESPHOMELIB_AUTOMATION_TCC
+#define ESPHOMELIB_AUTOMATION_TCC
+
 #include "esphomelib/automation.h"
 
 ESPHOMELIB_NAMESPACE_BEGIN
@@ -33,21 +36,31 @@ OrCondition<T>::OrCondition(const std::vector<Condition<T> *> &conditions)
     : conditions_(conditions) {
 
 }
-
 template<typename T>
-void Trigger<T>::add_on_trigger_callback(std::function<void(T)> &&f) {
-  this->on_trigger_.add(std::move(f));
+void Trigger<T>::set_parent(Automation<T> *parent) {
+  this->parent_ = parent;
 }
 
 template<typename T>
 void Trigger<T>::trigger(T x) {
-  this->on_trigger_.call(x);
+  this->parent_->process_trigger_(x);
 }
 
 template<typename T>
 void Action<T>::play_next(T x) {
-  if (this->next_ != nullptr)
+  if (this->next_ != nullptr) {
     this->next_->play(x);
+  }
+}
+template<typename T>
+void Action<T>::stop() {
+  this->stop_next();
+}
+template<typename T>
+void Action<T>::stop_next() {
+  if (this->next_ != nullptr) {
+    this->next_->stop();
+  }
 }
 
 template<typename T>
@@ -67,6 +80,15 @@ template<typename T>
 void DelayAction<T>::set_delay(uint32_t delay) {
   this->delay_ = delay;
 }
+template<typename T>
+float DelayAction<T>::get_setup_priority() const {
+  return setup_priority::HARDWARE;
+}
+template<typename T>
+void DelayAction<T>::stop() {
+  this->cancel_timeout("");
+  this->stop_next();
+}
 
 template<typename T>
 Condition<T> *Automation<T>::add_condition(Condition<T> *condition) {
@@ -81,9 +103,7 @@ void Automation<T>::add_conditions(const std::vector<Condition<T> *> &conditions
 }
 template<typename T>
 Automation<T>::Automation(Trigger<T> *trigger) : trigger_(trigger) {
-  this->trigger_->add_on_trigger_callback([this](T x) {
-    this->process_trigger_(x);
-  });
+
 }
 template<typename T>
 Action<T> *Automation<T>::add_action(Action<T> *action) {
@@ -101,6 +121,10 @@ void Automation<T>::process_trigger_(T x) {
   }
 
   this->actions_.play(x);
+}
+template<typename T>
+void Automation<T>::stop() {
+  this->actions_.stop();
 }
 template<typename T>
 LambdaCondition<T>::LambdaCondition(std::function<bool(T)> &&f)
@@ -139,6 +163,11 @@ template<typename T>
 void ActionList<T>::play(T x) {
   if (this->actions_begin_ != nullptr)
     this->actions_begin_->play(x);
+}
+template<typename T>
+void ActionList<T>::stop() {
+  if (this->actions_begin_ != nullptr)
+    this->actions_begin_->stop();
 }
 template<typename T>
 bool ActionList<T>::empty() const {
@@ -185,6 +214,12 @@ void IfAction<T>::add_else(const std::vector<Action<T> *> &actions) {
     this->play_next(x);
   }));
 }
+template<typename T>
+void IfAction<T>::stop() {
+  this->then_.stop();
+  this->else_.stop();
+  this->stop_next();
+}
 
 template<typename T>
 void UpdateComponentAction<T>::play(T x) {
@@ -215,4 +250,95 @@ ScriptExecuteAction<T> *Script::make_execute_action() {
   return new ScriptExecuteAction<T>(this);
 }
 
+template<typename T>
+ScriptStopAction<T>::ScriptStopAction(Script *script)
+    : script_(script) {
+
+}
+
+template<typename T>
+void ScriptStopAction<T>::play(T x) {
+  this->script_->stop();
+  this->play_next(x);
+}
+
+template<typename T>
+ScriptStopAction<T> *Script::make_stop_action() {
+  return new ScriptStopAction<T>(this);
+}
+
+template<typename T>
+GlobalVariableComponent<T>::GlobalVariableComponent() {
+
+}
+template<typename T>
+GlobalVariableComponent<T>::GlobalVariableComponent(T initial_value)
+    : value_(initial_value) {
+
+}
+template<typename T>
+T &GlobalVariableComponent<T>::value() {
+  return this->value_;
+}
+template<typename T>
+void GlobalVariableComponent<T>::setup() {
+  if (this->restore_value_) {
+    this->rtc_ = global_preferences.make_preference<T>(1944399030U ^ this->name_hash_);
+    this->rtc_.load(&this->value_);
+  }
+  memcpy(&this->prev_value_, &this->value_, sizeof(T));
+}
+template<typename T>
+float GlobalVariableComponent<T>::get_setup_priority() const {
+  return setup_priority::HARDWARE;
+}
+template<typename T>
+void GlobalVariableComponent<T>::loop() {
+  if (this->restore_value_) {
+    int diff = memcmp(&this->value_, &this->prev_value_, sizeof(T));
+    if (diff != 0) {
+      this->rtc_.save(&this->value_);
+      memcpy(&this->prev_value_, &this->value_, sizeof(T));
+    }
+  }
+}
+template<typename T>
+void GlobalVariableComponent<T>::set_restore_value(uint32_t name_hash) {
+  this->restore_value_ = true;
+  this->name_hash_ = name_hash;
+}
+template<typename T>
+WhileAction<T>::WhileAction(const std::vector<Condition<T> *> &conditions) : conditions_(conditions) {
+
+}
+template<typename T>
+void WhileAction<T>::add_then(const std::vector<Action<T> *> &actions) {
+  this->then_.add_actions(actions);
+  this->then_.add_action(new LambdaAction<T>([this](T x) {
+    this->is_running_ = false;
+    this->play(x);
+  }));
+}
+template<typename T>
+void WhileAction<T>::play(T x) {
+  if (this->is_running_)
+    return;
+
+  for (auto *condition : this->conditions_) {
+    if (!condition->check(x)) {
+      this->play_next(x);
+      return;
+    }
+  }
+  this->is_running_ = true;
+  this->then_.play(x);
+}
+template<typename T>
+void WhileAction<T>::stop() {
+  this->then_.stop();
+  this->stop_next();
+}
+
 ESPHOMELIB_NAMESPACE_END
+
+#endif //ESPHOMELIB_AUTOMATION_TCC
